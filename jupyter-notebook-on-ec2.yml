@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Resources:
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0c02fb55956c7d316
+      InstanceType: t3.nano
+      SubnetId: !Ref Subnet
+      SecurityGroupIds: 
+      - !Ref EC2SecurityGroup
+      KeyName: !Ref SSHKeyName
+      UserData:
+        Fn::Base64: !Sub
+        - |
+          #!/bin/bash -xe
+          # Install nginx and jupyter notebook
+          sudo amazon-linux-extras install nginx1.12 -y
+          sudo python3 -m pip install notebook
+
+          # Create keys
+          export DNS=$(curl -s http://169.254.169.254/latest/meta-data/public-hostname)
+          sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /home/ec2-user/mykey.key -out /home/ec2-user/mycert.pem -subj "/C=US/ST=Oregon/L=Portland/O=Company Name/OU=Org/CN=$DNS"
+          
+          # Configure nginx http traffic
+          sudo sed -iE "s/listen       80 default_server;$/listen       8888 default_server;/" /etc/nginx/nginx.conf
+          sudo sed -iE "s/listen       \[::\]:80 default_server;$/listen       [::]:8888 default_server;/" /etc/nginx/nginx.conf
+          sudo sed -iE "s/^\(        server_name\)  _;/\1  $DNS:8888;/" /etc/nginx/nginx.conf
+          sudo sed -iE "s/^\(        location \/ [{]\)/\1\n            proxy_pass http:\/\/127.0.0.1:8889;\n/" /etc/nginx/nginx.conf
+
+          # configure nginx https traffic
+          sudo sed -iE "s/^#\(    server [{]\)$/\1/" /etc/nginx/nginx.conf
+          sudo sed -iE "s/^#\(        listen       443 ssl http2 default_server;\)$/\1/" /etc/nginx/nginx.conf
+          sudo sed -iE "s/^#\(        listen       \[::\]:443 ssl http2 default_server;\)$/\1/" /etc/nginx/nginx.conf
+          sudo sed -iE "s/^#\(        server_name\)  _;/\1  $DNS:8888;/" /etc/nginx/nginx.conf
+          sudo sed -iE "s/^#\(        root\)/\1/" /etc/nginx/nginx.conf
+          sudo sed -iE "s/^#\(        ssl_certificate\) \"\/etc\/pki\/nginx\/server.crt\"/\1 \/home\/ec2-user\/mycert.pem/" /etc/nginx/nginx.conf
+          sudo sed -iE "s/^#\(        ssl_certificate_key\) \"\/etc\/pki\/nginx\/private\/server.key\"/\1 \/home\/ec2-user\/mykey.key/" /etc/nginx/nginx.conf
+          sudo sed -iE "s/^#\(        include \/etc\/nginx\/default.d\/\*.conf;\)/\1/" /etc/nginx/nginx.conf    
+          sudo sed -iE "s/^#\(        location \/ [{]\)/\1\n            proxy_pass https:\/\/127.0.0.1:8889;\n\t\}\}/" /etc/nginx/nginx.conf
+
+          # Configure jupyter notebook for https and password authentication
+          jupyter notebook --generate-config
+          sed -i "s/# c.NotebookApp.allow_remote_access = False/c.NotebookApp.allow_remote_access=True/" ~/.jupyter/jupyter_notebook_config.py
+          sed -i "s/# c.NotebookApp.allow_password_change = True/c.NotebookApp.allow_password_change=True/" ~/.jupyter/jupyter_notebook_config.py
+          sed -i "s/# c.NotebookApp.token = '<generated>'/c.NotebookApp.token=''/" ~/.jupyter/jupyter_notebook_config.py
+          echo "c = get_config()" >> ~/.jupyter/jupyter_notebook_config.py
+          echo "from IPython.lib import passwd" >> ~/.jupyter/jupyter_notebook_config.py
+          echo "password = passwd('${PWD}')" >> ~/.jupyter/jupyter_notebook_config.py
+          echo "c.NotebookApp.password = password"  >> ~/.jupyter/jupyter_notebook_config.py
+          
+          # Start jupyter notebook
+          systemctl start nginx
+          jupyter notebook --notebook-dir="/home/" --certfile=/home/ec2-user/mycert.pem --keyfile /home/ec2-user/mykey.key --port 8889 --allow-root --no-browser &
+          /opt/aws/bin/cfn-signal -e $? --stack ${STACK} --resource EC2Instance --region ${REGION}
+
+        - PWD: !Ref JupyterPassword
+          STACK: !Ref AWS::StackName
+          REGION: !Ref AWS::Region
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT5M
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Security group to allow access to the instance
+      VpcId: !Ref VPC
+      SecurityGroupIngress: 
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: !Ref MyIPAddress
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: !Ref MyIPAddress
+      - IpProtocol: tcp
+        FromPort: 8888
+        ToPort: 8889
+        CidrIp: !Ref MyIPAddress
+Parameters:
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC where you want to deploy
+  Subnet:
+    Type: AWS::EC2::Subnet::Id
+    Description: The subnet where you want to deploy
+  SSHKeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: A key pair to associate to the instance
+  MyIPAddress: 
+    Type: String  
+    Description: Enter a valid CIDR range which can access the Jupyter Notebook
+  JupyterPassword:
+    Type: String
+    Description: Enter a password for Jupyter Notebook authentication
+Outputs:
+  JupyterNotebookURL: 
+    Value: !Join
+      - ''
+      - - 'https://'
+        - !GetAtt EC2Instance.PublicDnsName
